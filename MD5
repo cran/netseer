@@ -1,0 +1,16 @@
+717bf401c318d295bb6e7fb7633f6119 *DESCRIPTION
+adc18e0a4185aa3a231cb39427eccc5c *NAMESPACE
+f3c9a550c4590da8126ff884a2550412 *R/functions.R
+c19ed5dcb6a8b5540861619a0ff74a4c *R/graph_generation.R
+404fe54d971d57c867b38657fd4ede76 *R/network_prediction.R
+a0f278ccf1d09868660eec59a3225223 *README.md
+cce2aa803e091d6716930325839c7212 *man/figures/README-grpred-1.png
+cce2aa803e091d6716930325839c7212 *man/figures/README-grpred1-1.png
+8915823a2a161a41f2d1854ab334e71c *man/figures/README-grpred2-1.png
+f196b36de0e12ab0375c63a0d4595400 *man/figures/README-grpred3-1.png
+9358603aa4fbe12ef7faefee34ce0e3c *man/figures/README-plotdata-1.png
+f07107278f9c42bfbdce16caa1b34c12 *man/figures/README-plotdata-2.png
+94a820fa5deb04e447d0e5045f0e075c *man/figures/README-plotdata-3.png
+9dccc2295a152a5455042cc49a2587aa *man/figures/logo.png
+400d1592ab253c336a21140903391dbc *man/generate_graph.Rd
+25323c6c3c8a9bcdb6db1baea411a1af *man/predict_graph.Rd
