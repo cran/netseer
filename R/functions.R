@@ -43,279 +43,37 @@ predict_graph_internal <- function(graphlist,
   #                 weights_opt = 3 is binary weights (more selective version)
   #                        1 for all except no-edges and some 1s for new
   #                 weights_opt = 4 proportional weights
+  rm_verts <- NULL
 
-
-  # Step 1 - forecast the number of nodes - done in predict_graph function
-
-
-  # Step 2 - Forecast the degree of the old nodes - done in predict_graph function
-  # But the other hilo values need to be taken from probj
-  f_rhs_hi <- probj$degree_hi
-  f_rhs_lo <- probj$degree_lo
-  freq <- probj$freq
-  vertex <- probj$vertex
-  total_hi <- probj$total_edges_upper
-  total_low <- probj$total_edges_lower
-
-  # Step 3 - Forecast the degree of new nodes
-  # For new nodes forecast the average degree of new nodes
-  rm_verts <- new_deg <- NULL
-  rhsobj <- compute_rhs(graphlist, formulation, new_nodes, f_rhs_hi, f_rhs_lo = NULL, vertex, freq, total_hi, total_low)
-  f_rhs <- rhsobj$f_rhs
-  new_deg <- rhsobj$new_deg
-  rm_verts <- rhsobj$rm_verts
-  signs <- rhsobj$signs
-
-
-  # Step 4 - Construct the union graph, find the constraint matrix and the weights
-  biggr <- construct_union_graph(graphlist, new_nodes, new_deg, rm_verts, weights_opt = weights_opt, weights_param = weights_param)
-  if(dense_opt == 1){
-    f_con <- constraint_matrix(biggr)
-  }else if(dense_opt == 2){
-    f_con <- constraint_matrix_dense(biggr)
+  pkg_debug(c("i"=sprintf("Using weights option %d", weights_opt)))
+  pkg_message(c("i"="Setting maximum degree constraint"))
+  max_degrees <- probj$degree_hi
+  if (new_nodes > 0){
+    new_degrees <- predict_new_nodes_degree(graphlist)
+    maximum_degrees <- c(max_degrees, rep(new_degrees, new_nodes)) #the maximum degrees for each vertex in the predicted graph
+  } else {
+    maximum_degrees <- max_degrees
   }
-  wts <- get_weights(biggr, f_con, weights_opt, dense_opt)
-  # Step 4.1 - Remove zero weights and associated entries for optimization
-  tighter_obj <- remove_zero_rows_and_columns(wts, f_rhs, f_con, f_obj, signs, dense_opt)
-  f_con <- tighter_obj$f_con
-  f_rhs <- tighter_obj$f_rhs
-  signs <- tighter_obj$signs
-  f_obj <- tighter_obj$f_obj
+  pkg_message(c("i"="Constructing union graph"))
+  biggr <- construct_union_graph(graphlist, new_nodes, maximum_degrees, rm_verts, weights_opt = weights_opt, weights_param = weights_param)
+  pkg_debug(c("i"=sprintf("The union graph has %d nodes, %d edges, with constraint to use %d edges", igraph::vcount(biggr), igraph::ecount(biggr), probj$total_edges_upper)))
+  pkg_message(c("i"="Setting sparse solver constraints"))
+  lpsolve_vars <- sparse_solver_formulation(biggr, maximum_degrees, probj$total_edges_upper)
+  pkg_message(c("i"="Running LPSolve"))
+  lpobj <- run_lpsolve_dense(lpsolve_vars$constraint_matrix, lpsolve_vars$objective_function, lpsolve_vars$constraint_rhs, lpsolve_vars$constraint_direction)
+  pkg_debug(c("i"=sprintf("LPSolve solution status (should be 0) is %d", lpobj$status) ))
+  pkg_message(c("i"="Constructing graph from LPSove Solution"))
+  grout <- graph_from_solution(lpobj$solution, lpsolve_vars$used_edges, igraph::vcount(biggr))
 
 
-  if(dense_opt == 1){
-    # Step 5 - Remove zero rows and Run lpSolve
-    # Remove zero rows
-    rhs_nonzero <- remove_zero_rhs(f_con, f_rhs, signs)
-    f_con <- rhs_nonzero$f_con
-    f_rhs <- rhs_nonzero$f_rhs
-    signs <- rhs_nonzero$signs
-    # # Remove >= rows. Because it didn't work for one example. NOT HAPPY ABOUT THIS!
-    # rhs_geq <- remove_less_than(f_con, f_rhs, signs)
-    # f_con <- rhs_geq$f_con
-    # f_rhs <- rhs_geq$f_rhs
-    # signs <- rhs_geq$signs
+  if (getOption("netseer.verbose", "quiet") == "debug"){
+    pkg_debug(c("i"="Checking that constraints are met"))
+    check_constraints(grout, maximum_degrees, probj$total_edges_upper)
   }
 
-  if(dense_opt == 1){
-    lpobj <-  run_lpsolve(f_con, f_obj, f_rhs, signs)
-  }else if(dense_opt == 2){
-    lpobj <-  run_lpsolve_dense(f_con, f_obj, f_rhs, signs)
-  }
-
-
-  # Step 6: Get the graph relating to the values
-  # Using the solution get the bit string - add the zeros that were there originally
-  bitstring <- rep(0, length(wts))
-  bitstring[which(wts!=0)] <- lpobj$solution
-
-  if(dense_opt == 1){
-    adj <- adjacency_from_solution(bitstring, igraph::gorder(biggr))
-    grout <- igraph::graph_from_adjacency_matrix(adj, mode = "undirected")
-  }else if (dense_opt == 2){
-    edges <- edgelist_from_solution(bitstring, igraph::gorder(biggr))
-    grout <- igraph::graph_from_edgelist(edges, directed = FALSE)
-    add_verts <- igraph::vcount(biggr) - igraph::vcount(grout)
-    if(add_verts > 0){
-      grout <- igraph::add_vertices(grout, add_verts)
-    }
-
-
-  }
-
-
+  pkg_message(c("i"="Predict graph internal done"))
   grout
 
-}
-
-remove_zero_rows_and_columns <- function(wts, f_rhs, f_con, f_obj, signs, dense_opt){
-
-  V1 <- V2 <- V3 <- renamed <- original <- NULL
-  # Columns - keep only non-zero ones
-  nonzero_col_inds <- which(wts != 0)
-  f_obj <- wts[nonzero_col_inds]
-  col_renamed_df <- data.frame(original = nonzero_col_inds, renamed = 1:length(nonzero_col_inds))
-
-  # Rows - keep only non-zero ones
-  nonzero_row_inds <- which(f_rhs !=0)
-  f_rhs <- f_rhs[nonzero_row_inds]
-  signs <- signs[nonzero_row_inds]
-  row_renamed_df <- data.frame(original = nonzero_row_inds, renamed = 1:length(nonzero_row_inds))
-
-  # Remove and rename the zero columns
-  if(dense_opt == 1){
-    f_con <- f_con[ ,nonzero_col_inds]
-  }else if(dense_opt == 2){
-    f_con <- f_con %>%
-      filter(V3 !=0)
-    f_con <- f_con %>%
-      filter(V2 %in% col_renamed_df$original) %>%
-      rename(original = V2) %>%
-      left_join(col_renamed_df) %>%
-      rename(V2 = renamed ) %>%
-      select(-original) %>%
-      select(V1, V2, V3)
-  }
-
-
-  # Remove and rename the zero rows
-  if(dense_opt == 1){
-    f_con <- f_con[nonzero_row_inds, ]
-  }else if(dense_opt == 2){
-    f_con <- f_con %>%
-      filter(V1 %in% row_renamed_df$original) %>%
-      rename(original = V1) %>%
-      left_join(row_renamed_df) %>%
-      rename(V1 = renamed) %>%
-      select(-original) %>%
-      select(V1, V2, V3)
-  }
-
-  list(
-    f_con = f_con,
-    f_rhs = f_rhs,
-    signs = signs,
-    f_obj = f_obj)
-}
-
-
-get_weights <- function(biggr, f_con, weights_opt, dense_opt){
-  # The length of the objective function
-  weight <- From <- To <- value <- constraint <- column <- NULL
-
-  if(dense_opt == 1){
-    len <- dim(f_con)[2]
-  }else if(dense_opt == 2){
-    len <- max(f_con[ ,2])
-  }
-
-  # weights schemes
-  f_obj <- rep(0, len)
-  if(weights_opt == 1){
-    f_obj <- rep(1, len)
-  }else if((weights_opt == 2)|(weights_opt == 3)){
-    if(dense_opt == 1){
-      # standard constraint matrix
-      colsums <- apply(f_con, 2, sum)
-      f_obj[which(colsums != 0)] <- 1
-    }else if(dense_opt == 2){
-      # dense constraint matrix
-      colnames(f_con) <- c("constraint", "column", "value")
-      cols <- f_con %>%
-        filter(value > 0) %>%
-        distinct(column) %>%
-        pull(column)
-      f_obj[cols] <- 1
-    }
-  }else if(weights_opt == 4){
-    # Weights df
-    weights <- cbind.data.frame(igraph::as_edgelist(biggr), igraph::E(biggr)$weight)
-    colnames(weights) <- c("From", "To", "weight")
-    weights <- weights %>%
-      arrange(From, To)
-    # Edges df as in the constraint matrix
-    n <- igraph::vcount(biggr)
-    from_seq <- c()
-    to_seq <- c()
-    for( i in 1:(n-1)){
-      t_seq <- (i+1):n
-      fr_seq <- rep(i, length(t_seq))
-      from_seq <- c(from_seq, fr_seq)
-      to_seq <- c(to_seq, t_seq)
-    }
-    df_edges <- data.frame("From" = from_seq, "To" = to_seq)
-    f_obj <- left_join(df_edges, weights) %>%
-      arrange(From, To) %>%
-      tidyr::replace_na(list(weight = 0)) %>%
-      pull(weight)
-  }
-  f_obj
-}
-
-
-
-remove_zero_rhs <- function(f_con, f_rhs, signs){
-  inds <- which(f_rhs == 0)
-  if(length(inds) > 0){
-    f_rhs <- f_rhs[-inds]
-    f_con <- f_con[-inds, ]
-    signs <- signs[-inds]
-  }
-  list(
-    f_con = f_con,
-    f_rhs = f_rhs,
-    signs = signs)
-
-}
-
-remove_less_than <- function(f_con, f_rhs, signs){
-  inds <- which(signs == '>=')
-  if(length(inds) > 0){
-    f_rhs <- f_rhs[-inds]
-    f_con <- f_con[-inds, ]
-    signs <- signs[-inds]
-  }
-  list(
-    f_con = f_con,
-    f_rhs = f_rhs,
-    signs = signs)
-
-}
-
-compute_rhs <- function(graphlist,
-                        formulation,
-                        new_nodes,
-                        f_rhs_hi,
-                        f_rhs_lo,
-                        vertex,
-                        freq,
-                        total_hi,
-                        total_lo){
-
-  degree <- new_deg <- f_rhs <- rm_verts <- NULL
-
-  if(new_nodes > 0){
-    new_deg <- predict_new_nodes_degree(graphlist)
-    if(is.null(f_rhs_lo)){
-      f_rhs <- c(f_rhs_hi, rep(new_deg, new_nodes))
-      signs <- c(rep("<=", length(f_rhs_hi)),  rep("<=", new_nodes) )
-    }else{
-      f_rhs <- c(f_rhs_hi, rep(new_deg, new_nodes), f_rhs_lo, rep(0, new_nodes))
-      signs <- c(rep("<=", length(f_rhs_hi)),  rep("<=", new_nodes), rep(">=", length(f_rhs_lo)), rep(">=", new_nodes) )
-    }
-  }else if(new_nodes == 0){
-    f_rhs <- c(f_rhs_hi, f_rhs_lo)
-    signs <- c(rep("<=", length(f_rhs_hi)), rep(">=", length(f_rhs_lo)) )
-  }else if(new_nodes < 0){
-    rm_num <- -1*new_nodes
-    signs <- c(rep("<=", length(f_rhs_hi)), rep(">=", length(f_rhs_lo)) )
-    df_temp <- data.frame(vertex = vertex, degree = c(f_rhs_hi, f_rhs_lo), signs = signs, freq = freq)
-    df_temp_rm <- df_temp %>%
-      filter(degree == 0) %>%
-      arrange(freq) %>%
-      dplyr::slice(1:rm_num)
-    df_temp2 <- dplyr::setdiff(df_temp, df_temp_rm)
-    f_rhs <- df_temp2 %>%
-      pull(degree)
-    rm_verts <- df_temp_rm %>%
-      pull(vertex)
-    signs <- df_temp2 %>%
-      pull(signs)
-  }
-
-  # If only formulation = 2
-  # Add the upper bound for total edges
-  if(formulation == 2){
-    f_rhs <- c(f_rhs, total_hi)
-    signs <- c(signs, "<=")
-  }
-
-  list(
-    new_deg = new_deg,
-    f_rhs = f_rhs,
-    rm_verts = rm_verts,
-    signs = signs
-  )
 }
 
 predict_num_nodes <- function(graphlist, conf_level = 90, h = 1){
@@ -390,8 +148,49 @@ construct_union_graph <- function(graphlist,
       }
     }
     igraph::E(biggr)$weight <- igraph::E(biggr)$weight/max(igraph::E(biggr)$weight)
+  }else if(weights_opt == 5){
+    # This is linearly decaying weights over time.
+    # ii goes from 1 to NN
+    # ii = 1 is the first time step
+    # ii = NN is the most recent time step
+    for(ii in 1:NN){
+      grr <- graphlist[[ii]]
+      igraph::E(grr)$weight <- ii # this line make linear decaying weights
+      if(ii == 1){
+        biggr <- grr
+      }else{
+        biggr <- (biggr %u% grr)
+        igraph::E(biggr)$weight_1[is.na(igraph::E(biggr)$weight_1)] <- 0
+        igraph::E(biggr)$weight_2[is.na(igraph::E(biggr)$weight_2)] <- 0
+        igraph::E(biggr)$weight <- igraph::E(biggr)$weight_1 +  igraph::E(biggr)$weight_2
+      }
+    }
+    igraph::E(biggr)$weight <- igraph::E(biggr)$weight/max(igraph::E(biggr)$weight)
+  }else if(weights_opt == 6){
+    # This is decaying weights over time like 1, 1/2, 1/3, etc . . .
+    # ii goes from 1 to NN
+    # ii = 1 is the first time step
+    # ii = NN is the most recent time step
+    for(ii in 1:NN){
+      grr <- graphlist[[ii]]
+      igraph::E(grr)$weight <- 1/(NN - ii + 1) # this line make harmonically decaying weights
+      if(ii == 1){
+        biggr <- grr
+      }else{
+        biggr <- (biggr %u% grr)
+        igraph::E(biggr)$weight_1[is.na(igraph::E(biggr)$weight_1)] <- 0
+        igraph::E(biggr)$weight_2[is.na(igraph::E(biggr)$weight_2)] <- 0
+        igraph::E(biggr)$weight <- igraph::E(biggr)$weight_1 +  igraph::E(biggr)$weight_2
+      }
+    }
+    igraph::E(biggr)$weight <- igraph::E(biggr)$weight/max(igraph::E(biggr)$weight)
+  }else if(weights_opt == 7){
+    # This set of weights give 1 to the last time step and 0 to the rest
+    biggr <- graphlist[[NN]]
+    igraph::E(biggr)$weight <- 1
   }else{
-    # For t = 1 to n
+  # For weight options 1, 2, 3
+  # For t = 1 to n
     for(ii in 1:NN){
       grr <- graphlist[[ii]]
       if(ii == 1){
@@ -401,12 +200,45 @@ construct_union_graph <- function(graphlist,
       }
     }
   }
+  existing_edges <- igraph::ecount(biggr)
+
+  # Weights for new edges according to quantile
+  if(weights_opt %in% c(4,5,6)){
+    new_weights <- quantile(igraph::E(biggr)$weight, probs = weights_param)
+  }else if(weights_opt == 7){
+    new_weights <- weights_param
+  }
+
+
+  # Add edges if nodes share a neighbour but do not already have an edge directly to each other
+  pkg_message(c("i"="Adding neighbours of neighbours"))
+  bigadj1 <- igraph::as_adjacency_matrix(biggr)
+  bigadj2 <- bigadj1 %*% bigadj1
+  non_edges <- Matrix::which((bigadj2 > 0) & (bigadj1 == 0), arr.ind=TRUE) #neighbours of neighbours edges
+  non_edges <- t(non_edges[non_edges[,1] < non_edges[,2],])
+
+  if(weights_opt %in% c(4,5,6,7)){
+    biggr <- igraph::add_edges(biggr, non_edges, weight = 2*new_weights)
+  }else{
+    # weights_opt 1, 2, 3
+    biggr <- igraph::add_edges(biggr, non_edges)
+  }
 
   if(new_nodes > 0){
     # Add new nodes
+    pkg_message(c("i"="Adding new nodes, and their edges"))
     biggr <- igraph::add_vertices(biggr, new_nodes)
     new_vertices <- igraph::V(biggr)[( igraph::gorder(biggr)-new_nodes+1):igraph::gorder(biggr)]
-    old_vertices <- igraph::V(biggr)[1:(igraph::gorder(biggr)-new_nodes)]
+    # Use only a fixed number of old vertices
+    # Which vertices have the highest degree
+    grlast <- graphlist[[NN]]
+    num_attach <- 10 # attach potential edges to this number of nodes in the union graph, with the highest degrees
+    pkg_debug(c("i"=sprintf("Attaching possible edges to the new nodes and the top %d existing nodes, by degree", num_attach)))
+    if(igraph::vcount(grlast) > num_attach){
+      old_vertices <- igraph::V(biggr)[order(igraph::degree(grlast), decreasing = TRUE)[1:num_attach]]
+    }else{
+      old_vertices <- igraph::V(biggr)[1:(igraph::gorder(biggr)-new_nodes)]
+    }
 
     new_deg2 <- min(2*new_deg, igraph::vcount(biggr))
     verts <- order(igraph::degree(biggr), decreasing = TRUE)[1:new_deg2]
@@ -419,14 +251,15 @@ construct_union_graph <- function(graphlist,
       # Binary weights - new nodes connected to most connected old nodes
       # Add new edges from new nodes to mostly connected vertices
       possible_edges <- c(rbind(rep(verts, new_nodes), rep(new_vertices, each = length(verts)) ))
-    }else if(weights_opt == 4){
+    }else if(weights_opt == 4|weights_opt == 5|weights_opt == 6|weights_opt == 7){
       # Proportional weights - new nodes connected to all old nodes
       # But the weights will be much smaller
       possible_edges <- c(rbind(rep(old_vertices, new_nodes), rep(new_vertices, each = length(old_vertices)) ))
-      new_weights <- quantile(igraph::E(biggr)$weight, probs = weights_param)
+      new_weights0 <- igraph::degree(biggr)[old_vertices]/(sum(igraph::degree(biggr)[old_vertices]))
+      new_weights <- quantile(igraph::E(biggr)$weight, probs = new_weights0)
+      new_weights <- rep(new_weights, new_nodes )
     }
-
-    if(weights_opt == 4){
+    if(weights_opt == 4|weights_opt == 5|weights_opt == 6|weights_opt == 7){
       biggr <- biggr %>%
         igraph::add_edges(possible_edges,weight = new_weights)
     }else{
@@ -435,13 +268,18 @@ construct_union_graph <- function(graphlist,
     }
 
   }
+
+  total_edges <- igraph::ecount(biggr)
+  new_edges <- total_edges - existing_edges
+  pkg_debug(c("i"=sprintf("The union graph has %d existing edges, %d new edges, for %d total edges and %.2f%% are new nodes", existing_edges, new_edges, total_edges, 100*new_edges/total_edges)))
+
   biggr
 }
 
 
 predict_old_nodes_degree <- function(graphlist, conf_level2, h){
   # Forecast the degree of the old nodes
-
+  future::plan(future::multisession)
   degree <- edges <- hilow <- lower <- upper <- upper2 <- lower2  <- mean2 <- NULL
 
   NN <- length(graphlist)
@@ -474,17 +312,29 @@ predict_old_nodes_degree <- function(graphlist, conf_level2, h){
 
 
   # Fit ARIMA models
-  fit <- dfmerge %>%
-    fabletools::model(arima = fable::ARIMA(degree),
-                      naive = fable::NAIVE(degree)) %>%
-    fabletools::forecast(h = h) %>%
-    full_join(dffreq)
+  #original version
+  #fit <- dfmerge %>%
+  #  fabletools::model(arima = fable::ARIMA(degree),
+  #                    naive = fable::NAIVE(degree)) %>%
+  #  fabletools::forecast(h = h) %>%
+  #  full_join(dffreq)
+
+  #%>% #split apart version, for better profiling
+  pkg_message(c("i"="Making fabletools model"))
+    fbm <-fabletools::model(.data=dfmerge, arima = fable::ARIMA(degree),
+                      naive = fable::NAIVE(degree))
+    fc <- fabletools::forecast(object=fbm, h = h)
+    fit <- dplyr::full_join(fc, dffreq, by="vertex")
 
   # Fit ARIMA for total edges
-  fit_total <-  tibble::as_tibble(dfall_sum) %>%
-    tsibble::as_tsibble(index = time) %>%
-    fabletools::model(arima = fable::ARIMA(edges)) %>%
-    fabletools::forecast(h = h)
+  pkg_message(c("i"="Running fabletools on total number of edges"))
+  #this fabletools/ARIMA code seems to fail to fit sometimes
+  #fit_total <-  tibble::as_tibble(dfall_sum) %>%
+  #  tsibble::as_tsibble(index = time) %>%
+  #  fabletools::model(arima = fable::ARIMA(edges)) %>% # ~ time
+  #  fabletools::forecast(h = h)
+  #so use forecast/auto.arima for now
+  fit_total <- forecast::auto.arima(dfall_sum$edges) %>% forecast::forecast(h = h, level = conf_level2)
 
   # Get hilo for vertices separately
   dfhilo <- fit %>%
@@ -503,8 +353,9 @@ predict_old_nodes_degree <- function(graphlist, conf_level2, h){
               freq = mean(freq))
 
   # Get hilo for total edges
-  dfhilo_total <- fit_total %>%
-    fabletools::hilo(level = conf_level2)
+  #pkg_message("Getting hilo of total edges")
+  #dfhilo_total <- fit_total %>%
+  #  fabletools::hilo(level = conf_level2)
 
 
   # Forecast of the old nodes
@@ -530,16 +381,23 @@ predict_old_nodes_degree <- function(graphlist, conf_level2, h){
   }
 
   #  Total edges predictions
-  total_edges_mean <- dfhilo_total %>%
-    pull(.data$.mean) %>%
-    ceiling()
-  colnames(dfhilo_total)[5] <- 'hilow'
-  dfhilo_total <- dfhilo_total %>%
-    mutate(lower = floor(hilow$lower), upper = ceiling(hilow$upper))
-  total_edges_lower <- dfhilo_total %>%
-    pull(lower)
-  total_edges_upper <- dfhilo_total %>%
-    pull(upper)
+  #total_edges_mean <- dfhilo_total %>%
+  #  pull(.data$.mean) %>%
+  #  ceiling()
+  #colnames(dfhilo_total)[5] <- 'hilow'
+  #dfhilo_total <- dfhilo_total %>%
+  #  mutate(lower = floor(hilow$lower), upper = ceiling(hilow$upper))
+  #total_edges_lower <- dfhilo_total %>%
+  #  pull(lower)
+  #total_edges_upper <- dfhilo_total %>%
+  #  pull(upper)
+  #forecast::forecast() code
+  total_edges_lower <- as.integer(fit_total$lower) #forecast gives these as numeric/float values, so we need to convert them to integers
+  total_edges_upper <- as.integer(fit_total$upper)
+  total_edges_mean <- as.integer(fit_total$mean)
+
+  ## Explicitly close multisession workers by switching plan
+  future::plan(future::sequential)
 
 
   list(
@@ -591,7 +449,6 @@ run_lpsolve <- function(f_con, f_obj, f_rhs, signs){
   lpobj
 }
 
-
 run_lpsolve_dense <- function(f_con, f_obj, f_rhs, signs){
   f_con <- as.matrix(f_con)
   f_dir <- signs
@@ -603,8 +460,6 @@ run_lpsolve_dense <- function(f_con, f_obj, f_rhs, signs){
                        all.bin = TRUE)
   lpobj
 }
-
-
 
 growth_metrics <- function(graphlist){
   n <- length(graphlist)
@@ -633,7 +488,6 @@ growth_metrics <- function(graphlist){
     deg_cosine_sim = deg_cosine_sim
   )
 }
-
 
 eval_metrics <- function(actualgr, predgr){
 
@@ -722,154 +576,105 @@ diff_metrics <- function(act, pred) {
   )
 }
 
-
-constraint_matrix <- function(gr){
-  # gr is an igraph
-  adj <- igraph::as_adjacency_matrix(gr)
-  num_cols <- dim(adj)[1]*(dim(adj)[1] - 1)/2
-  NN <- num_rows <- dim(adj)[1]
-  constr_mat <- matrix(0, nrow = num_rows, ncol = num_cols)
-  st_col <- 1
-  for(jj in 1:(num_rows-1)){
-    vals <- adj[jj,(jj+1):NN]
-    en_col <- st_col + length(vals) - 1
-    # Update relevant row in the constraint matrix
-    constr_mat[jj, st_col:en_col] <- vals
-    # Fill the diagonal in the submatrix below
-    if(dim(diag(vals))[1] == 0){
-      # Last entry - no matrix, only 1 entry
-      constr_mat[(jj+1):NN,st_col:en_col] <- vals
-    }else{
-      constr_mat[(jj+1):NN,st_col:en_col] <-  diag(vals)
-    }
-
-    # Update st_col
-    st_col <- en_col + 1
-
+sparse_solver_formulation <- function(union_graph, max_degrees, total_edges_constraint){
+  #create the LP Solve inputs from a union graph. Each edge in this graph should be considered as a possible component in the predicted graph
+  degrees <- igraph::degree(union_graph)
+  used_nodes <- which(degrees > 0)
+  num_zero_edge_nodes <- igraph::vcount(union_graph) - length(used_nodes)
+  pkg_debug(c("i"=sprintf("The union graph has %d nodes, %d nodes have no edges", igraph::vcount(union_graph), num_zero_edge_nodes)))
+  objective_function <- igraph::E(union_graph)$weight#igraph::V(union_graph)[used_nodes]
+  constraint_rhs <- c(max_degrees[used_nodes], total_edges_constraint)
+  num_nodes <- length(used_nodes)
+  num_edges <- igraph::ecount(union_graph)
+  edge_list <- igraph::as_edgelist(union_graph)
+  #remove nodes/constraints with zero edges because LPSolve does not accept them
+  if (num_zero_edge_nodes > 0){
+    vertex_offset <- 1:(igraph::vcount(union_graph)) - cumsum(degrees <= 0) #offset the from and to vertices by this amount, to remove nodes with zero edges
+    edge_list[,1] <-vertex_offset[edge_list[,1]]
+    edge_list[,2] <-vertex_offset[edge_list[,2]]
   }
 
-  # All edges constraint
-  all_edges <- rep(1, dim(constr_mat)[2])
-  constr_mat <- rbind.data.frame(constr_mat, all_edges)
+  constraint_matrix_rows <- 3*num_edges
+  constraint_matrix <- matrix(data=1, nrow=constraint_matrix_rows, ncol=3)
+  #set degree constraints for the source vertex in each edge
+  idxs <- 1:num_edges
+  constraint_matrix[idxs,1] <- edge_list[,1]
+  constraint_matrix[idxs,2] <- idxs
+  #set degree constraints for the target vertex in each edge
+  end_idxs <- (num_edges+1):(2*num_edges)
+  constraint_matrix[end_idxs,1] <- edge_list[,2]
+  constraint_matrix[end_idxs,2] <- idxs
+  #set total number of edges constraint
+  end_idxs <- (2*num_edges+1):(3*num_edges)
+  constraint_matrix[end_idxs,1] <- length(constraint_rhs)
+  constraint_matrix[end_idxs,2] <- idxs
+  constraint_direction = c(rep("<=", num_nodes), "<=") #degree constraints, and total number of edges constraint
 
-  constr_mat
-}
+  stopifnot(all(constraint_matrix[,1] <= igraph::vcount(union_graph)+1) )
+  stopifnot(all(constraint_matrix[,2] <= igraph::ecount(union_graph)  ) )
 
-
-constraint_matrix_dense <- function(gr){
-  # gr is an igraph
-  From <- To <- V1 <- V2 <- NULL
-
-  edges <- igraph::as_edgelist(gr)
-  colnames(edges) <- c("From", "To")
-  n <- igraph::vcount(gr)
-  n_seq <- c(0,seq(n-1, 1))
-  n_seq2 <- cumsum(n_seq)
-  for( i in 1:n){
-    vertex <- i
-    dat_edges <- edges %>%
-      as.data.frame() %>%
-      dplyr::filter(From == i)
-    if(NROW(dat_edges) > 0){
-      df <- matrix(0, nrow = 2*NROW(dat_edges), ncol = 3)
-      to_edges <- dat_edges[ ,2]
-      cols <- n_seq2[i] + to_edges-i
-      len <- NROW(dat_edges)
-      # The first part of the constraints
-      # en <- st + len - 1
-      df[1:len, 1] <- i
-      df[1:len, 2] <- cols
-      df[1:len, 3] <- 1
-      df[(len+1):(2*len), 1] <- to_edges
-      df[(len+1):(2*len), 2] <- cols
-      df[(len+1):(2*len), 3] <- 1
-    }else{
-      df <- matrix(c(i, n_seq2[i], 0), nrow = 1)
-    }
-    if(i == 1){
-      dense_mat <- df
-    }else{
-      dense_mat <- rbind.data.frame(dense_mat, df)
-    }
-  }
-  # Total edges constraint
-  num_rows <- max(dense_mat[ ,2])
-  edges_const <- data.frame(constraint = (n+1), coef = 1:num_rows, val = 1)
-  colnames(edges_const) <- colnames(dense_mat)
-  dense_mat <- rbind.data.frame(dense_mat, edges_const)
-
-  dense_mat <- dense_mat %>%
-    as.data.frame() %>%
-    arrange(V1, V2)
-
-  dense_mat
-
-}
-
-
-constraint_matrix_with_newnodes <- function(gr, newnodes){
-  # gr is an igraph
-  # newnodes is the number of new nodes
-  adj <- igraph::as_adjacency_matrix(gr)
-  num_cols <- dim(adj)[1]*(dim(adj)[1] - 1)/2
-  NN <- num_rows <- dim(adj)[1]
-  constr_mat <- matrix(0, nrow = num_rows, ncol = num_cols)
-  new_positions <- rep(0, num_cols)
-  st_col <- 1
-  for(jj in 1:(num_rows-1)){
-    vals <- adj[jj,(jj+1):NN]
-    en_col <- st_col + length(vals) - 1
-    # Update relevant row in the constraint matrix
-    constr_mat[jj, st_col:en_col] <- vals
-    # Fill the diagonal in the submatrix below
-    if(dim(diag(vals))[1] == 0){
-      # Last entry - no matrix, only 1 entry
-      constr_mat[(jj+1):NN,st_col:en_col] <- vals
-    }else{
-      constr_mat[(jj+1):NN,st_col:en_col] <-  diag(vals)
-    }
-
-    # New positions vector
-    new_positions[(en_col-newnodes + 1):en_col] <- 1
-
-    # Update st_col
-    st_col <- en_col + 1
-
-  }
   list(
-    constr_mat = constr_mat,
-    new_positions = new_positions)
-
+    objective_function = objective_function,
+    constraint_matrix = constraint_matrix,
+    constraint_direction = constraint_direction,
+    constraint_rhs = constraint_rhs,
+    used_edges = igraph::as_edgelist(union_graph)#use original vertex indices
+  )
 }
 
-
-
-adjacency_from_solution <- function(x, n){
-  # x is the solution vector
-  # n is the number of vertices
-  adj <- matrix(0, nrow = n, ncol = n)
-  adj[lower.tri(adj)] <- x
-  adj2 <- t(adj)
-  adj2[lower.tri(adj2)] <- x
-  adj2
+#construct a graph from the LPSolve Solution
+graph_from_solution <- function(solution, edge_list, num_nodes){
+  indices <- which(solution > 0)
+  edges_in_solution <- edge_list[indices,]
+  solution_graph <- igraph::graph_from_edgelist(edges_in_solution, directed=FALSE)
+  #add in the required number of nodes, in case the last node(s) have zero edges
+  if (num_nodes > igraph::vcount(solution_graph)){
+    pkg_debug(c("i"=sprintf("adding %d new nodes to solution", num_nodes - igraph::vcount(solution_graph)) ))
+    solution_graph <- igraph::add_vertices(solution_graph, num_nodes - igraph::vcount(solution_graph))
+  }
+  pkg_debug(c("i"=sprintf("The solution graph has %d nodes and %d edges", igraph::vcount(solution_graph), igraph::ecount(solution_graph))))
+  solution_graph
 }
 
-edgelist_from_solution <- function(x, n){
-  # x is the solution vector
-  # n is the number of vertices
-  v_seq <- 1:n
-  for(i in 1:(n-1)){
-    v1 <- rep(i,(n-i))
-    v2 <- (i+1):n
-    df <- cbind.data.frame(v1, v2)
-    if(i == 1){
-      dfall <- df
-    }else{
-      dfall <- rbind.data.frame(dfall, df)
+check_constraints <-function(graph, degree_constraints, total_edges_constraint){
+  #check whether or not a predicted graph meets the given constraints - uses the rhs of the constraints
+  num_edges <- length(degree_constraints)
+  graph_degrees <- igraph::degree(graph)
+  same_degrees <- graph_degrees <= degree_constraints
+  correct <- TRUE
+  if (!all(same_degrees)) {
+    correct <- FALSE
+    for (i in 1:num_edges){
+      if (graph_degrees[i] > degree_constraints[i]){
+        pkg_message(c=("x"=sprintf("Node %d has degree %d but should be <= %d", i, graph_degrees[i], degree_constraints[i])))
+      }
     }
   }
-  edges <-as.matrix(dfall[which(x == 1), ])
-  edges
-
+  actual_num_edges <- igraph::ecount(graph)
+  if (total_edges_constraint != actual_num_edges){
+    correct <- FALSE
+    pkg_debug(c("x"=sprintf("The graph has %d edges, was expecting %d edges", actual_num_edges, total_edges_constraint)))
+  }
+  if (correct){
+    pkg_debug(c("i"="All constraints met") )
+  }
+  return(correct)
 }
 
+#print messages, if in verbose or debug mode
+pkg_message <- function(...){
+  verbosity <- getOption("netseer.verbose", "quiet")
+  if (verbosity %in% c("verbose", "debug")){
+    rlang::local_options(rlib_message_verbosity = "verbose")
+    rlang::inform(...)
+  }
+}
+
+#print messages, if in debug mode
+pkg_debug <- function(...){
+  verbosity <- getOption("netseer.verbose", "quiet")
+  if (verbosity == "debug"){
+    rlang::local_options(rlib_message_verbosity = "verbose")
+    rlang::inform(...)
+  }
+}

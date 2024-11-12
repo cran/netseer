@@ -17,11 +17,15 @@
 #' set to \code{90}.
 #' @param dense_opt If set to \code{2} the dense option in R package \code{lpSolve}
 #' will be used.
-#' @param weights_opt Weights option ranging from 1 to 4 used for different edge weight
+#' @param weights_opt Weights option ranging from 1 to 6 used for different edge weight
 #' schemes. Weights option 1 uses uniform weights for all edges. Option 2 uses binary
 #' weights. If the edge existed in a past graph, then weight is set to 1. Else set to
 #' 0. All possible new edges are assigned weight 1. Option 3 is a more selective
-#' version. Option 4 is proportional weights according to the history.
+#' version. Option 4 uses proportional weights according to the history. Option 5 uses
+#' proportional weights, but as the network is more in the past, it gives less weight.
+#' Option 5 uses linearly decaying proportional weights. Option 6 uses harmonically decaying
+#' weights. That is the network at \code{T} is given weight 1,  \code{T-1}
+#' is given weight 1/2 and so on. Default is set to \code{6}.
 #' @param weights_param The weight given for possible edges from new vertices. Default
 #' set to \code{0.001}.
 #' @param h The prediction time step. Default is \code{ h = 1}.
@@ -33,20 +37,23 @@
 #' If If \code{conf_level1} is \code{NULL}, only the mean predicted graph is returned.
 #'
 #' @examples
-#' library(igraph)
 #' set.seed(2024)
 #' edge_increase_val <- new_nodes_val <- del_edge_val <- 0.1
 #' graphlist <- list()
 #' graphlist[[1]] <- gr <-  igraph::sample_pa(5, directed = FALSE)
 #' for(i in 2:15){
-#'   gr <-  generate_graph(gr,
+#'   gr <-  generate_graph_exp(gr,
 #'                         del_edge = del_edge_val,
 #'                         new_nodes = new_nodes_val,
 #'                         edge_increase = edge_increase_val )
 #'   graphlist[[i]] <- gr
 #' }
-#' grpred <- predict_graph(graphlist[1:15], conf_level2 = 90, weights_opt = 4)
+#' grpred <- predict_graph(graphlist[1:15], conf_level2 = 90, weights_opt = 6)
 #' grpred
+#'  \dontshow{
+#'   # R CMD check: make sure any open connections are closed afterward
+#'   if (!inherits(future::plan(), "sequential")) future::plan(sequential)
+#'   }
 #'
 #' @importFrom dplyr pull summarize mutate group_by n full_join filter arrange
 #' @importFrom dplyr left_join select rename '%>%' if_else distinct
@@ -59,7 +66,7 @@ predict_graph <- function(graphlist,
                           conf_level1 = NULL,
                           conf_level2 = 90,
                           dense_opt = 2,
-                          weights_opt = 4,
+                          weights_opt = 6,
                           weights_param = 0.001,
                           h = 1){
   # graphlist is the list of graphs
@@ -81,6 +88,7 @@ predict_graph <- function(graphlist,
   grout_upper <- grout_lower <- graph_mean <- graph_lower <- graph_upper <- NULL
 
   # Step 1 - forecast the number of nodes
+  pkg_message(c("i"="Predicting number of nodes"))
   new_nodes_list <-  predict_num_nodes(graphlist, conf_level1, h)
   new_nodes <- new_nodes_list$new_nodes
   if(!is.null(conf_level1)){
@@ -91,9 +99,11 @@ predict_graph <- function(graphlist,
   }
 
   # Step 2 - Forecast the degree of the old nodes
+  pkg_message(c("i"="Predicting old nodes degrees"))
   probj <- predict_old_nodes_degree(graphlist, conf_level2, h)
 
   # Step 3 - Using the above predict the mean graph
+  pkg_message(c("i"="Starting internal function"))
   grout <- predict_graph_internal(graphlist,
                                   formulation,
                                   conf_level1,
